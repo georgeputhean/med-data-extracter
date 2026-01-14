@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 import { GoogleGenAI, Type, FunctionDeclaration, LiveServerMessage, Modality } from "@google/genai";
 
 // --- Types ---
+type AppMode = 'intake' | 'sales';
+
 interface PatientData {
   fullName: string;
   dob: string;
@@ -11,6 +13,16 @@ interface PatientData {
   planType: string;
   copay: string;
   deductible: string;
+  notes: string;
+}
+
+interface SalesData {
+  physicianName: string;
+  specialty: string;
+  clinicName: string;
+  productDiscussed: string;
+  samplesLeft: string;
+  nextVisitDate: string;
   notes: string;
 }
 
@@ -67,7 +79,7 @@ async function decodeAudioData(
   return buffer;
 }
 
-// --- Initial State ---
+// --- Initial States ---
 const initialPatientData: PatientData = {
   fullName: "",
   dob: "",
@@ -79,7 +91,19 @@ const initialPatientData: PatientData = {
   notes: "",
 };
 
+const initialSalesData: SalesData = {
+  physicianName: "",
+  specialty: "",
+  clinicName: "",
+  productDiscussed: "",
+  samplesLeft: "",
+  nextVisitDate: "",
+  notes: "",
+};
+
 // --- Gemini Configuration ---
+
+// 1. Patient Intake Config
 const updatePatientTool: FunctionDeclaration = {
   name: "updatePatientRecord",
   description: "Updates the patient information record with extracted details from the conversation.",
@@ -95,12 +119,11 @@ const updatePatientTool: FunctionDeclaration = {
       deductible: { type: Type.STRING, description: "Deductible amount if mentioned" },
       notes: { type: Type.STRING, description: "Medical notes, symptoms, or chief complaint" },
     },
-    // Adding required array to be explicit, though fields are optional in practice, the schema often likes it.
     required: [] 
   },
 };
 
-const SYSTEM_INSTRUCTION = `You are an efficient and helpful Medical Intake Assistant. 
+const PATIENT_SYSTEM_INSTRUCTION = `You are an efficient and helpful Medical Intake Assistant. 
 Your goal is to extract patient information from the user (who is a receptionist or nurse) to populate the patient record.
 1. ALWAYS use the 'updatePatientRecord' tool when new information is provided.
 2. If the user provides multiple details, extract all of them in one tool call.
@@ -108,13 +131,44 @@ Your goal is to extract patient information from the user (who is a receptionist
 4. If critical info (Name, Insurance, Copay) is missing, politely ask for it, but do not be repetitive.
 5. If the user corrects information, overwrite the previous value using the tool.`;
 
+// 2. Sales Rep Config
+const updateSalesTool: FunctionDeclaration = {
+  name: "updateSalesRecord",
+  description: "Updates the sales visit report with extracted details from the conversation.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      physicianName: { type: Type.STRING, description: "Name of the physician/HCP visited" },
+      specialty: { type: Type.STRING, description: "Primary specialty of the physician" },
+      clinicName: { type: Type.STRING, description: "Name of the clinic, hospital, or practice" },
+      productDiscussed: { type: Type.STRING, description: "Key product(s) discussed during the visit" },
+      samplesLeft: { type: Type.STRING, description: "Details on samples or materials left (e.g. '5 boxes of X')" },
+      nextVisitDate: { type: Type.STRING, description: "Planned date or timeframe for the follow-up visit" },
+      notes: { type: Type.STRING, description: "Key insights, objections, questions asked, or general notes" },
+    },
+    required: []
+  },
+};
+
+const SALES_SYSTEM_INSTRUCTION = `You are an efficient Sales Assistant for a pharmaceutical representative.
+Your goal is to help the rep log their visit with a Healthcare Professional (HCP).
+1. ALWAYS use the 'updateSalesRecord' tool when information about the visit is provided.
+2. Extract the Physician's name, specialty, and clinic details.
+3. Record products discussed and any samples left.
+4. Note any follow-up dates or important qualitative notes/objections.
+5. Be concise and professional.`;
+
 function App() {
-  const [messages, setMessages] = useState<Message[]>([
-    { role: "ai", text: "Hello. I'm ready to assist with patient intake. Please provide the patient details." }
-  ]);
+  const [activeTab, setActiveTab] = useState<AppMode>('intake');
+  
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  
+  // Data States
   const [patientData, setPatientData] = useState<PatientData>(initialPatientData);
+  const [salesData, setSalesData] = useState<SalesData>(initialSalesData);
+  
   const [lastUpdatedFields, setLastUpdatedFields] = useState<Set<string>>(new Set());
   const [isLiveConnected, setIsLiveConnected] = useState(false);
 
@@ -125,19 +179,46 @@ function App() {
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
-  // Transcription refs removed as we are disabling it to fix errors
-  
-  // Initialize Text Chat
+
+  // --- Configuration Management ---
+  const getConfig = (mode: AppMode) => {
+    if (mode === 'sales') {
+      return {
+        instruction: SALES_SYSTEM_INSTRUCTION,
+        tools: [{ functionDeclarations: [updateSalesTool] }],
+        initialMessage: "Ready to log your sales visit. Who did you see today?"
+      };
+    } else {
+      return {
+        instruction: PATIENT_SYSTEM_INSTRUCTION,
+        tools: [{ functionDeclarations: [updatePatientTool] }],
+        initialMessage: "Hello. I'm ready to assist with patient intake. Please provide the patient details."
+      };
+    }
+  };
+
+  // Initialize Chat Session when Tab Changes
   useEffect(() => {
+    // 1. Disconnect Live if active to prevent state mismatch
+    if (isLiveConnected) {
+      disconnectLive();
+    }
+
+    // 2. Reset Messages
+    const config = getConfig(activeTab);
+    setMessages([{ role: "ai", text: config.initialMessage }]);
+    
+    // 3. Initialize Text Chat Client
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     chatSessionRef.current = ai.chats.create({
       model: "gemini-3-flash-preview",
       config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        tools: [{ functionDeclarations: [updatePatientTool] }],
+        systemInstruction: config.instruction,
+        tools: config.tools,
       },
     });
-  }, []);
+
+  }, [activeTab]); // Dependency on activeTab ensures re-init
 
   // Clean up Audio on unmount
   useEffect(() => {
@@ -169,7 +250,7 @@ function App() {
         const newUpdates = new Set<string>();
 
         for (const call of functionCalls) {
-          if (call.name === "updatePatientRecord") {
+          if (call.name === "updatePatientRecord" && activeTab === 'intake') {
              const args = call.args as Partial<PatientData>;
              setPatientData(prev => {
                const updated = { ...prev };
@@ -182,12 +263,22 @@ function App() {
                });
                return updated;
              });
-
-             toolResponses.push({
-               name: call.name,
-               response: { result: "Patient record updated successfully." },
-               id: call.id
+             toolResponses.push({ name: call.name, response: { result: "Patient record updated." }, id: call.id });
+          } 
+          else if (call.name === "updateSalesRecord" && activeTab === 'sales') {
+             const args = call.args as Partial<SalesData>;
+             setSalesData(prev => {
+               const updated = { ...prev };
+               Object.keys(args).forEach(key => {
+                 const k = key as keyof SalesData;
+                 if (args[k]) {
+                   updated[k] = args[k] as string;
+                   newUpdates.add(k);
+                 }
+               });
+               return updated;
              });
+             toolResponses.push({ name: call.name, response: { result: "Sales record updated." }, id: call.id });
           }
         }
         
@@ -234,7 +325,8 @@ function App() {
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
+      const config = getConfig(activeTab);
+
       // Setup Audio Contexts
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -245,11 +337,8 @@ function App() {
         model: "gemini-2.5-flash-native-audio-preview-12-2025",
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: [updatePatientTool] }],
-          // NOTE: Transcription disabled to prevent 'Invalid Argument' error.
-          // inputAudioTranscription: {},
-          // outputAudioTranscription: {},
+          systemInstruction: config.instruction,
+          tools: config.tools,
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           }
@@ -259,7 +348,6 @@ function App() {
             console.log("Live Session Connected");
             setIsLiveConnected(true);
             
-            // Start streaming input
             const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
             
@@ -293,37 +381,38 @@ function App() {
              // 2. Handle Tool Calls
              if (message.toolCall) {
                for (const fc of message.toolCall.functionCalls) {
-                 if (fc.name === "updatePatientRecord") {
+                 const newUpdates = new Set<string>();
+                 
+                 if (fc.name === "updatePatientRecord" && activeTab === 'intake') {
                    const args = fc.args as Partial<PatientData>;
-                   console.log("Live Tool Call:", args);
-
-                   const newUpdates = new Set<string>();
                    setPatientData(prev => {
                      const updated = { ...prev };
                      Object.keys(args).forEach(key => {
                        const k = key as keyof PatientData;
-                       if (args[k]) {
-                         updated[k] = args[k] as string;
-                         newUpdates.add(k);
-                       }
+                       if (args[k]) { updated[k] = args[k] as string; newUpdates.add(k); }
                      });
                      return updated;
                    });
-
-                   setLastUpdatedFields(newUpdates);
-                   setTimeout(() => setLastUpdatedFields(new Set()), 2000);
-
-                   // Send response back to Live session
-                   sessionPromise.then(session => {
-                     session.sendToolResponse({
-                       functionResponses: [{
-                         id: fc.id,
-                         name: fc.name,
-                         response: { result: "Updated" }
-                       }]
+                 } else if (fc.name === "updateSalesRecord" && activeTab === 'sales') {
+                   const args = fc.args as Partial<SalesData>;
+                   setSalesData(prev => {
+                     const updated = { ...prev };
+                     Object.keys(args).forEach(key => {
+                       const k = key as keyof SalesData;
+                       if (args[k]) { updated[k] = args[k] as string; newUpdates.add(k); }
                      });
+                     return updated;
                    });
                  }
+
+                 setLastUpdatedFields(newUpdates);
+                 setTimeout(() => setLastUpdatedFields(new Set()), 2000);
+
+                 sessionPromise.then(session => {
+                   session.sendToolResponse({
+                     functionResponses: [{ id: fc.id, name: fc.name, response: { result: "Updated" } }]
+                   });
+                 });
                }
              }
           },
@@ -377,7 +466,7 @@ function App() {
 
   // --- UI Components ---
 
-  const Field = ({ label, fieldKey, value }: { label: string, fieldKey: keyof PatientData, value: string }) => {
+  const Field = ({ label, fieldKey, value }: { label: string, fieldKey: string, value: string }) => {
     const isUpdated = lastUpdatedFields.has(fieldKey);
     return (
       <div className="field-group">
@@ -389,26 +478,51 @@ function App() {
     );
   };
 
+  const TabButton = ({ mode, label }: { mode: AppMode, label: string }) => (
+    <button
+      onClick={() => setActiveTab(mode)}
+      style={{
+        padding: '0.75rem 1.5rem',
+        borderBottom: activeTab === mode ? '3px solid var(--primary)' : '3px solid transparent',
+        background: 'transparent',
+        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
+        color: activeTab === mode ? 'var(--primary)' : 'var(--text-muted)',
+        fontWeight: activeTab === mode ? 700 : 500,
+        cursor: 'pointer',
+        fontSize: '1rem',
+        transition: 'all 0.2s'
+      }}
+    >
+      {label}
+    </button>
+  );
+
   return (
     <div className="h-full flex-col">
-      <header className="header">
-        <div className="brand">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 6v12M6 12h12" />
-            <rect width="18" height="18" x="3" y="3" rx="2" />
-          </svg>
-          MedExtract AI
-        </div>
-        <div>
-           <button 
+      <header className="header" style={{ paddingBottom: 0, flexDirection: 'column', alignItems: 'flex-start', gap: '1rem' }}>
+        <div style={{ width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div className="brand">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 6v12M6 12h12" />
+              <rect width="18" height="18" x="3" y="3" rx="2" />
+            </svg>
+            MedExtract AI
+          </div>
+          <button 
              onClick={() => {
-               setPatientData(initialPatientData);
-               setMessages([{ role: "ai", text: "Record cleared. Ready for next patient." }]);
+               if (activeTab === 'intake') setPatientData(initialPatientData);
+               if (activeTab === 'sales') setSalesData(initialSalesData);
+               setMessages([{ role: "ai", text: "Record cleared. Ready." }]);
              }}
-             style={{ background: 'transparent', border: '1px solid #cbd5e1', padding: '0.5rem 1rem', borderRadius: '0.5rem', cursor: 'pointer', color: '#64748b' }}
+             style={{ background: 'transparent', border: '1px solid #cbd5e1', padding: '0.4rem 0.8rem', borderRadius: '0.5rem', cursor: 'pointer', color: '#64748b', fontSize: '0.9rem' }}
            >
-             New Patient
+             Clear Form
            </button>
+        </div>
+        
+        <div style={{ display: 'flex', gap: '1rem' }}>
+          <TabButton mode="intake" label="Patient Intake" />
+          <TabButton mode="sales" label="Sales Visit Rep" />
         </div>
       </header>
 
@@ -430,7 +544,6 @@ function App() {
           </div>
           
           <form className="input-area" onSubmit={handleSendMessage}>
-            {/* Mic Toggle */}
             <button 
                type="button" 
                className={`mic-btn ${isLiveConnected ? 'active' : ''}`}
@@ -457,7 +570,7 @@ function App() {
 
             <textarea
               className="chat-input"
-              placeholder={isLiveConnected ? "Listening..." : "Type patient details here..."}
+              placeholder={isLiveConnected ? "Listening..." : "Type details here..."}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -474,27 +587,44 @@ function App() {
         <div className="data-section">
           <div className="card">
             <div className="card-header">
-              <h2 className="card-title">Live Patient Record</h2>
+              <h2 className="card-title">
+                {activeTab === 'intake' ? 'Patient Record' : 'Sales Visit Report'}
+              </h2>
               <p className="card-subtitle">Real-time data extraction</p>
             </div>
             <div className="data-grid">
-              <Field label="Full Name" fieldKey="fullName" value={patientData.fullName} />
-              <Field label="DOB / Age" fieldKey="dob" value={patientData.dob} />
               
-              <div style={{ height: '1px', background: 'var(--border)', margin: '0.5rem 0' }} />
-              
-              <Field label="Insurance Provider" fieldKey="insuranceProvider" value={patientData.insuranceProvider} />
-              <Field label="Plan Type" fieldKey="planType" value={patientData.planType} />
-              <Field label="Policy / Member ID" fieldKey="policyNumber" value={patientData.policyNumber} />
-              
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-                <Field label="Copay" fieldKey="copay" value={patientData.copay} />
-                <Field label="Deductible" fieldKey="deductible" value={patientData.deductible} />
-              </div>
+              {activeTab === 'intake' ? (
+                // PATIENT FIELDS
+                <>
+                  <Field label="Full Name" fieldKey="fullName" value={patientData.fullName} />
+                  <Field label="DOB / Age" fieldKey="dob" value={patientData.dob} />
+                  <div style={{ height: '1px', background: 'var(--border)', margin: '0.5rem 0' }} />
+                  <Field label="Insurance Provider" fieldKey="insuranceProvider" value={patientData.insuranceProvider} />
+                  <Field label="Plan Type" fieldKey="planType" value={patientData.planType} />
+                  <Field label="Policy / Member ID" fieldKey="policyNumber" value={patientData.policyNumber} />
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                    <Field label="Copay" fieldKey="copay" value={patientData.copay} />
+                    <Field label="Deductible" fieldKey="deductible" value={patientData.deductible} />
+                  </div>
+                  <div style={{ height: '1px', background: 'var(--border)', margin: '0.5rem 0' }} />
+                  <Field label="Notes / Symptoms" fieldKey="notes" value={patientData.notes} />
+                </>
+              ) : (
+                // SALES FIELDS
+                <>
+                  <Field label="Physician / HCP Name" fieldKey="physicianName" value={salesData.physicianName} />
+                  <Field label="Specialty" fieldKey="specialty" value={salesData.specialty} />
+                  <Field label="Clinic / Hospital" fieldKey="clinicName" value={salesData.clinicName} />
+                  <div style={{ height: '1px', background: 'var(--border)', margin: '0.5rem 0' }} />
+                  <Field label="Product Discussed" fieldKey="productDiscussed" value={salesData.productDiscussed} />
+                  <Field label="Samples Left" fieldKey="samplesLeft" value={salesData.samplesLeft} />
+                  <div style={{ height: '1px', background: 'var(--border)', margin: '0.5rem 0' }} />
+                  <Field label="Next Visit Date" fieldKey="nextVisitDate" value={salesData.nextVisitDate} />
+                  <Field label="Notes / Objections" fieldKey="notes" value={salesData.notes} />
+                </>
+              )}
 
-              <div style={{ height: '1px', background: 'var(--border)', margin: '0.5rem 0' }} />
-              
-              <Field label="Notes / Symptoms" fieldKey="notes" value={patientData.notes} />
             </div>
           </div>
         </div>
