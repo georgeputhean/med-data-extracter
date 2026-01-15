@@ -29,6 +29,7 @@ interface SalesData {
 interface Message {
   role: "user" | "ai";
   text: string;
+  isStreaming?: boolean;
 }
 
 // --- Helpers for Audio ---
@@ -125,7 +126,7 @@ const updatePatientTool: FunctionDeclaration = {
 
 const PATIENT_SYSTEM_INSTRUCTION = `You are an efficient and helpful Medical Intake Assistant. 
 Your goal is to extract patient information from the user (who is a receptionist or nurse) to populate the patient record.
-1. ALWAYS use the 'updatePatientRecord' tool when new information is provided.
+1. ALWAYS use the 'updatePatientRecord' tool IMMEDIATELY when new information is provided. Do not wait for the user to finish speaking if you have a clear value.
 2. If the user provides multiple details, extract all of them in one tool call.
 3. Be conversational but concise. Confirm what you have recorded.
 4. If critical info (Name, Insurance, Copay) is missing, politely ask for it, but do not be repetitive.
@@ -152,7 +153,7 @@ const updateSalesTool: FunctionDeclaration = {
 
 const SALES_SYSTEM_INSTRUCTION = `You are an efficient Sales Assistant for a pharmaceutical representative.
 Your goal is to help the rep log their visit with a Healthcare Professional (HCP).
-1. ALWAYS use the 'updateSalesRecord' tool when information about the visit is provided.
+1. ALWAYS use the 'updateSalesRecord' tool IMMEDIATELY when information about the visit is provided.
 2. Extract the Physician's name, specialty, and clinic details.
 3. Record products discussed and any samples left.
 4. Note any follow-up dates or important qualitative notes/objections.
@@ -179,6 +180,10 @@ function App() {
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
+
+  // Transcription Refs (to avoid stale closures in callbacks)
+  const currentInputTranscription = useRef("");
+  const currentOutputTranscription = useRef("");
 
   // --- Configuration Management ---
   const getConfig = (mode: AppMode) => {
@@ -341,12 +346,17 @@ function App() {
           tools: config.tools,
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-          }
+          },
+          // Enable transcription to show real-time feedback
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
             console.log("Live Session Connected");
             setIsLiveConnected(true);
+            currentInputTranscription.current = "";
+            currentOutputTranscription.current = "";
             
             const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
@@ -378,7 +388,24 @@ function App() {
                }
              }
 
-             // 2. Handle Tool Calls
+             // 2. Handle Transcription
+             if (message.serverContent?.inputTranscription) {
+               const text = message.serverContent.inputTranscription.text;
+               currentInputTranscription.current += text;
+               // Update UI with partial input
+               setInput(currentInputTranscription.current);
+             }
+             
+             if (message.serverContent?.turnComplete) {
+                // When turn is complete, commit the transcription to messages
+                if (currentInputTranscription.current) {
+                   setMessages(prev => [...prev, { role: "user", text: currentInputTranscription.current }]);
+                   currentInputTranscription.current = "";
+                   setInput(""); // clear partial input
+                }
+             }
+
+             // 3. Handle Tool Calls
              if (message.toolCall) {
                for (const fc of message.toolCall.functionCalls) {
                  const newUpdates = new Set<string>();
@@ -453,6 +480,7 @@ function App() {
       outputAudioContextRef.current = null;
     }
     setIsLiveConnected(false);
+    setInput(""); // Clear partial transcription
   };
 
   const toggleLive = () => {
@@ -506,7 +534,7 @@ function App() {
               <path d="M12 6v12M6 12h12" />
               <rect width="18" height="18" x="3" y="3" rx="2" />
             </svg>
-            MedExtract AI
+            Agentic AI Demo
           </div>
           <button 
              onClick={() => {
@@ -535,6 +563,12 @@ function App() {
                 {msg.text}
               </div>
             ))}
+            {/* Show live partial input if available */}
+            {isLiveConnected && input && (
+               <div className="message-bubble user" style={{ opacity: 0.7 }}>
+                 {input}
+               </div>
+            )}
             {isLoading && (
               <div className="message-bubble ai" style={{ opacity: 0.7 }}>
                 <span className="typing-dot">...</span>
@@ -574,10 +608,10 @@ function App() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={isLoading} 
+              disabled={isLoading || isLiveConnected} 
               rows={1}
             />
-            <button className="send-btn" type="submit" disabled={isLoading || !input.trim()}>
+            <button className="send-btn" type="submit" disabled={isLoading || isLiveConnected || !input.trim()}>
               Send
             </button>
           </form>
